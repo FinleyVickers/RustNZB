@@ -56,6 +56,7 @@ impl NzbFile {
         let mut current_segments = Vec::new();
         let mut current_groups = Vec::new();
         let mut in_head = false;
+        let mut current_segment_index = None;
 
         loop {
             match xml_reader.read_event_into(&mut buf) {
@@ -71,12 +72,16 @@ impl NzbFile {
                                 .find(|attr| attr.key.as_ref() == b"date")
                                 .and_then(|attr| String::from_utf8(attr.value.to_vec()).ok())
                                 .and_then(|s| s.parse().ok());
+                            let subject = attrs.iter()
+                                .find(|attr| attr.key.as_ref() == b"subject")
+                                .and_then(|attr| String::from_utf8(attr.value.to_vec()).ok())
+                                .unwrap_or_default();
 
                             current_file = Some(NzbFileEntry {
-                                subject: String::new(),
+                                subject: subject.clone(),
                                 groups: Vec::new(),
                                 segments: Vec::new(),
-                                filename: String::new(),
+                                filename: extract_filename_from_subject(&subject),
                                 bytes: 0,
                                 poster,
                                 date,
@@ -117,6 +122,7 @@ impl NzbFile {
                                 bytes,
                                 message_id: String::new(),
                             });
+                            current_segment_index = Some(current_segments.len() - 1);
                         }
                         _ => {}
                     }
@@ -139,12 +145,20 @@ impl NzbFile {
                                 current_groups.clear();
                             }
                         }
+                        b"segment" => {
+                            current_segment_index = None;
+                        }
                         _ => {}
                     }
                 }
                 Ok(Event::Text(e)) => {
                     if let Some(file) = current_file.as_mut() {
-                        file.subject = String::from_utf8_lossy(&e.into_inner()).into_owned();
+                        if let Some(index) = current_segment_index {
+                            // Update the message ID of the current segment
+                            current_segments[index].message_id = String::from_utf8_lossy(&e.into_inner()).into_owned();
+                        } else {
+                            file.subject = String::from_utf8_lossy(&e.into_inner()).into_owned();
+                        }
                     }
                 }
                 Ok(Event::Eof) => break,
@@ -158,23 +172,40 @@ impl NzbFile {
 }
 
 fn extract_filename_from_subject(subject: &str) -> String {
+    // First decode any HTML entities
+    let decoded = subject.replace("&quot;", "\"")
+                        .replace("&amp;", "&")
+                        .replace("&lt;", "<")
+                        .replace("&gt;", ">");
+
     // Common patterns for filenames in subjects
     let patterns = vec![
-        Regex::new(r#""([^"]+)""#).unwrap(),           // Quoted filename
-        Regex::new(r#"\[(\d+/\d+)\] - "([^"]+)""#).unwrap(), // Common scene format
-        Regex::new(r#"(?i)filename:?\s*(.+?)(?:\s*\(|\s*$)"#).unwrap(), // Explicit filename
+        // Pattern for "[XX/YY] - "filename"" format
+        Regex::new(r#"\[\d+/\d+\]\s*-\s*"([^"]+)""#).unwrap(),
+        // Simple quoted filename
+        Regex::new(r#""([^"]+)""#).unwrap(),
+        // Explicit filename
+        Regex::new(r#"(?i)filename:?\s*(.+?)(?:\s*\(|\s*$)"#).unwrap(),
     ];
 
     for pattern in patterns {
-        if let Some(caps) = pattern.captures(subject) {
-            if let Some(filename) = caps.get(1).or_else(|| caps.get(2)) {
-                return sanitize_filename::sanitize(filename.as_str());
+        if let Some(caps) = pattern.captures(&decoded) {
+            if let Some(filename) = caps.get(1) {
+                let filename = filename.as_str().trim();
+                // Remove yEnc suffix and any trailing/leading quotes
+                let filename = filename.replace(" yEnc", "")
+                                     .trim_matches('"')
+                                     .to_string();
+                return sanitize_filename::sanitize(&filename);
             }
         }
     }
 
     // Fallback: use the whole subject but sanitize it
-    sanitize_filename::sanitize(subject)
+    let subject = decoded.replace(" yEnc", "")
+                        .trim_matches('"')
+                        .to_string();
+    sanitize_filename::sanitize(&subject)
 }
 
 #[cfg(test)]

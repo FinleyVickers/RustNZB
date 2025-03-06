@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use tokio::sync::Semaphore;
 use tracing::{info, error, warn};
 use postprocess::PostProcessor;
+use directories;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -223,8 +224,22 @@ async fn main() -> Result<()> {
                 .context("Failed to parse NZB file")?;
 
             let base_output_dir = output_dir.unwrap_or_else(|| config.download_dir.clone());
-            let temp_dir = config.temp_dir.join("current_download");
+            
+            // Create temp directory in user's cache directory
+            let cache_dir = directories::ProjectDirs::from("com", "rustnzb", "rustnzb")
+                .context("Failed to determine cache directory")?
+                .cache_dir()
+                .to_path_buf();
+            let temp_dir = cache_dir.join("current_download");
+            
+            // Ensure temp directory exists and is clean
+            if temp_dir.exists() {
+                std::fs::remove_dir_all(&temp_dir)?;
+            }
             std::fs::create_dir_all(&temp_dir)?;
+
+            // Ensure output directory exists
+            std::fs::create_dir_all(&base_output_dir)?;
 
             let multi_progress = MultiProgress::new();
             let style = ProgressStyle::default_bar()
@@ -255,7 +270,7 @@ async fn main() -> Result<()> {
                             connections: server.connections,
                         });
 
-                        match client.connect().await {
+                        match client.try_connect().await {
                             Ok(_) => {
                                 match client.download_segment(&segment.message_id).await {
                                     Ok(data) => {
@@ -288,10 +303,27 @@ async fn main() -> Result<()> {
                 }
 
                 if !segment_data.is_empty() {
-                    let output_path = temp_dir.join(&file.filename);
-                    tokio::fs::write(&output_path, segment_data).await?;
+                    let safe_filename = sanitize_filename::sanitize(&file.filename);
+                    let output_path = temp_dir.join(&safe_filename);
+                    
+                    // Ensure the file doesn't exist
+                    if output_path.exists() {
+                        if output_path.is_dir() {
+                            std::fs::remove_dir_all(&output_path)?;
+                        } else {
+                            std::fs::remove_file(&output_path)?;
+                        }
+                    }
+                    
+                    // Ensure parent directory exists
+                    if let Some(parent) = output_path.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                    
+                    // Write the file
+                    tokio::fs::write(&output_path, &segment_data).await?;
                     downloaded_files.push(output_path);
-                    pb.finish_with_message("Done");
+                    pb.finish_with_message(format!("Done: {}", safe_filename));
                 }
             }
 
@@ -320,8 +352,12 @@ async fn main() -> Result<()> {
                 info!("Post-processing complete. Files extracted to: {}", base_output_dir.display());
             } else {
                 // If no unpacking, just move files to the output directory
+                std::fs::create_dir_all(&base_output_dir)?;
                 for file in downloaded_files {
                     let target = base_output_dir.join(file.file_name().unwrap());
+                    if let Some(parent) = target.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
                     std::fs::rename(file, target)?;
                 }
                 info!("Download complete. Files saved to: {}", base_output_dir.display());

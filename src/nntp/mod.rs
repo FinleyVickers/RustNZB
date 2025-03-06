@@ -1,11 +1,12 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::net::TcpStream;
-use tokio::io::{AsyncWriteExt, AsyncBufReadExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio_rustls::client::TlsStream;
-use rustls::{ClientConfig, RootCertStore};
+use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerName};
 use tracing::{debug, error};
-use tokio_rustls::rustls::ServerName;
+use tokio_rustls::TlsConnector;
+use std::sync::Arc;
 
 pub struct NntpConfig {
     pub host: String,
@@ -34,274 +35,227 @@ enum NntpStream {
 
 #[derive(Debug, thiserror::Error)]
 pub enum NntpError {
-    #[error("Article not found (430)")]
-    ArticleNotFound,
-    #[error("No permission (480)")]
-    NoPermission,
-    #[error("Authentication required (480)")]
-    AuthenticationRequired,
-    #[error("Authentication failed (481/482)")]
-    AuthenticationFailed,
-    #[error("Password required (381)")]
-    PasswordRequired,
-    #[error("Username required (381)")]
-    UsernameRequired,
-    #[error("Invalid response: {0}")]
-    InvalidResponse(String),
     #[error("Connection error: {0}")]
     ConnectionError(#[from] std::io::Error),
     #[error("TLS error: {0}")]
     TlsError(String),
     #[error("DNS error: {0}")]
     DnsError(String),
+    #[error("Authentication failed")]
+    AuthenticationFailed,
+    #[error("Invalid message ID")]
+    InvalidMessageId,
+    #[error("Article not found (430/423)")]
+    ArticleNotFound,
     #[error("Other error: {0}")]
     Other(String),
 }
 
 impl NntpClient {
     pub fn new(config: NntpConfig) -> Self {
-        Self {
+        NntpClient {
             config,
             stream: None,
         }
     }
 
-    async fn handle_response(&mut self, response: &str) -> Result<(), NntpError> {
-        debug!("Server response: {}", response);
-        
-        // Some servers might include a description after the response code
-        let parts: Vec<&str> = response.split_whitespace().collect();
-        let code = parts.first()
-            .ok_or_else(|| NntpError::InvalidResponse("Empty response".to_string()))?;
-        
-        match *code {
-            // Standard success codes
-            "200" | "201" | "211" | "215" | "220" | "221" | "222" | "223" | "224" => Ok(()),
-            // Authentication success
-            "281" => Ok(()),
-            "381" => {
-                debug!("Auth response: {}", response);
-                // Some servers might send 381 without explicitly mentioning "PASS"
-                Err(NntpError::PasswordRequired)
-            }
-            "430" => Err(NntpError::ArticleNotFound),
-            "480" => {
-                if response.to_lowercase().contains("authentication") {
-                    Err(NntpError::AuthenticationRequired)
-                } else {
-                    Err(NntpError::NoPermission)
-                }
-            }
-            "481" | "482" => Err(NntpError::AuthenticationFailed),
-            _ => Err(NntpError::InvalidResponse(response.to_string())),
-        }
-    }
-
-    pub async fn connect(&mut self) -> Result<(), NntpError> {
-        let stream = if self.config.use_ssl {
-            let mut root_store = RootCertStore::empty();
-            root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
-                rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
-                    ta.subject,
-                    ta.spki,
-                    ta.name_constraints,
-                )
-            }));
-
-            let config = ClientConfig::builder()
-                .with_safe_defaults()
-                .with_root_certificates(root_store)
-                .with_no_client_auth();
-
-            let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
-            let tcp_stream = TcpStream::connect((self.config.host.as_str(), self.config.port))
-                .await
-                .map_err(|e| NntpError::ConnectionError(e))?;
-
-            // Set TCP_NODELAY for better performance
-            tcp_stream.set_nodelay(true)
-                .map_err(NntpError::ConnectionError)?;
-            
-            let dns_name = ServerName::try_from(self.config.host.as_str())
-                .map_err(|e| NntpError::DnsError(e.to_string()))?;
-            
-            // Add retry logic for TLS connection
-            let mut retry_count = 0;
-            let max_retries = 3;
-            let mut last_error = None;
-
-            while retry_count < max_retries {
-                match connector.connect(dns_name.clone(), tcp_stream.try_clone().await
-                    .map_err(NntpError::ConnectionError)?).await {
-                    Ok(tls_stream) => {
-                        let buffered = BufReader::new(BufWriter::new(tls_stream));
-                        break NntpStream::Tls(buffered);
-                    }
-                    Err(e) => {
-                        error!("TLS connection attempt {} failed: {}", retry_count + 1, e);
-                        last_error = Some(e);
-                        retry_count += 1;
-                        if retry_count < max_retries {
-                            // Small delay before retry
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
-                    }
-                }
-            }
-
-            if retry_count >= max_retries {
-                return Err(NntpError::TlsError(format!("Failed after {} attempts: {}", 
-                    max_retries, last_error.unwrap())));
-            }
-        } else {
-            let tcp_stream = TcpStream::connect((self.config.host.as_str(), self.config.port))
-                .await
-                .map_err(NntpError::ConnectionError)?;
-
-            // Set TCP_NODELAY for better performance
-            tcp_stream.set_nodelay(true)
-                .map_err(NntpError::ConnectionError)?;
-
-            let buffered = BufReader::new(BufWriter::new(tcp_stream));
-            NntpStream::Plain(buffered)
-        };
-
-        self.stream = Some(stream);
-
-        // Read welcome message
+    async fn read_response(&mut self) -> Result<String, NntpError> {
         let mut response = String::new();
         match self.stream.as_mut().unwrap() {
             NntpStream::Plain(s) => {
-                s.read_line(&mut response).await.map_err(NntpError::ConnectionError)?;
+                s.read_line(&mut response).await?;
             }
             NntpStream::Tls(s) => {
-                s.read_line(&mut response).await.map_err(NntpError::ConnectionError)?;
+                s.read_line(&mut response).await?;
             }
         }
-        debug!("Welcome message: {}", response);
-
-        // Some servers might require authentication regardless of welcome message
-        if let (Some(username), Some(password)) = (self.config.username.clone(), self.config.password.clone()) {
-            debug!("Starting authentication for user: {}", username);
-            
-            // Send username
-            let auth_response = self.send_command(&format!("AUTHINFO USER {}", username)).await?;
-            debug!("Username response: {}", auth_response);
-
-            // Always send password after username, regardless of response
-            let pass_response = self.send_command(&format!("AUTHINFO PASS {}", password)).await?;
-            debug!("Password response: {}", pass_response);
-
-            // Check final authentication status
-            match self.handle_response(&pass_response).await {
-                Ok(_) => {
-                    debug!("Authentication successful");
-                    Ok(())
-                }
-                Err(NntpError::AuthenticationFailed) => {
-                    error!("Authentication failed with correct credentials");
-                    Err(NntpError::AuthenticationFailed)
-                }
-                Err(e) => {
-                    error!("Unexpected error during authentication: {:?}", e);
-                    Err(e)
-                }
-            }
-        } else {
-            debug!("No credentials provided, skipping authentication");
-            self.handle_response(&response).await
-        }
-    }
-
-    async fn send_command(&mut self, command: &str) -> Result<String, NntpError> {
-        let stream = self.stream.as_mut()
-            .ok_or_else(|| NntpError::Other("Not connected".to_string()))?;
-        
-        debug!("Sending command: {}", command);
-        
-        // Send command
-        match stream {
-            NntpStream::Plain(s) => {
-                s.write_all(format!("{}\r\n", command).as_bytes())
-                    .await
-                    .map_err(NntpError::ConnectionError)?;
-                s.flush().await.map_err(NntpError::ConnectionError)?;
-            }
-            NntpStream::Tls(s) => {
-                s.write_all(format!("{}\r\n", command).as_bytes())
-                    .await
-                    .map_err(NntpError::ConnectionError)?;
-                s.flush().await.map_err(NntpError::ConnectionError)?;
-            }
-        }
-
-        // Read response
-        let mut response = String::new();
-        match stream {
-            NntpStream::Plain(s) => {
-                s.read_line(&mut response).await.map_err(NntpError::ConnectionError)?;
-            }
-            NntpStream::Tls(s) => {
-                s.read_line(&mut response).await.map_err(NntpError::ConnectionError)?;
-            }
-        }
-        debug!("Received response: {}", response);
-
         Ok(response)
     }
 
-    pub async fn download_segment(&mut self, message_id: &str) -> Result<Vec<u8>, NntpError> {
-        debug!("Downloading segment: {}", message_id);
-        
-        // Validate message ID
-        if message_id.trim().is_empty() {
-            error!("Empty message ID provided");
-            return Err(NntpError::Other("Empty message ID provided".to_string()));
-        }
-        
-        // Request article
-        let response = self.send_command(&format!("ARTICLE {}", message_id)).await?;
-        self.handle_response(&response).await?;
-
-        // Read article data
-        let mut data = Vec::new();
-        let mut line = String::new();
-        let mut in_body = false;
-
+    async fn send_command(&mut self, command: &str) -> Result<(), NntpError> {
+        debug!("Sending command: {}", command);
+        let cmd = format!("{}\r\n", command);
         match self.stream.as_mut().unwrap() {
             NntpStream::Plain(s) => {
-                while s.read_line(&mut line).await.map_err(NntpError::ConnectionError)? > 0 {
-                    if line.trim() == "." {
-                        break;
-                    }
-                    if line.trim().is_empty() {
-                        in_body = true;
-                        continue;
-                    }
-                    if in_body {
-                        data.extend_from_slice(line.as_bytes());
-                    }
-                    line.clear();
-                }
+                s.write_all(cmd.as_bytes()).await?;
+                s.flush().await?;
             }
             NntpStream::Tls(s) => {
-                while s.read_line(&mut line).await.map_err(NntpError::ConnectionError)? > 0 {
-                    if line.trim() == "." {
-                        break;
-                    }
-                    if line.trim().is_empty() {
-                        in_body = true;
-                        continue;
-                    }
-                    if in_body {
-                        data.extend_from_slice(line.as_bytes());
-                    }
-                    line.clear();
+                s.write_all(cmd.as_bytes()).await?;
+                s.flush().await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn try_connect(&mut self) -> Result<(), NntpError> {
+        let host = self.config.host.clone();
+        let port = self.config.port;
+        let use_ssl = self.config.use_ssl;
+        self.connect(&host, port, use_ssl).await
+    }
+
+    async fn create_tls_connector() -> Result<TlsConnector, NntpError> {
+        let mut root_store = RootCertStore::empty();
+        root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
+            rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
+                ta.subject,
+                ta.spki,
+                ta.name_constraints,
+            )
+        }));
+
+        let mut config = ClientConfig::builder()
+            .with_safe_defaults()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        // Allow legacy protocols and ciphers for compatibility
+        config.alpn_protocols.clear();
+        
+        // Create connector
+        let connector = TlsConnector::from(Arc::new(config));
+        Ok(connector)
+    }
+
+    pub async fn connect(&mut self, host: &str, port: u16, use_tls: bool) -> Result<(), NntpError> {
+        let tcp_stream = TcpStream::connect((host, port)).await?;
+        tcp_stream.set_nodelay(true)?;
+
+        if use_tls {
+            let connector = Self::create_tls_connector().await?;
+            let domain = ServerName::try_from(host)
+                .map_err(|_| NntpError::Other("Invalid hostname".to_string()))?;
+
+            // Try plain TLS first
+            match connector.connect(domain.clone(), tcp_stream).await {
+                Ok(tls_stream) => {
+                    self.stream = Some(NntpStream::Tls(BufReader::new(BufWriter::new(tls_stream))));
                 }
+                Err(e) => {
+                    debug!("TLS connection failed: {}", e);
+                    // If TLS fails, try connecting without TLS
+                    let tcp_stream = TcpStream::connect((host, port)).await?;
+                    tcp_stream.set_nodelay(true)?;
+                    self.stream = Some(NntpStream::Plain(BufReader::new(BufWriter::new(tcp_stream))));
+                }
+            }
+        } else {
+            self.stream = Some(NntpStream::Plain(BufReader::new(BufWriter::new(tcp_stream))));
+        }
+
+        // Read welcome message
+        let welcome = self.read_response().await?;
+        debug!("Welcome message: {}", welcome);
+
+        // Authenticate if credentials are provided
+        let username = self.config.username.as_ref().cloned();
+        let password = self.config.password.as_ref().cloned();
+
+        if let (Some(username), Some(password)) = (username, password) {
+            debug!("Starting authentication for user: {}", username);
+            
+            // Send username
+            let username_cmd = format!("AUTHINFO USER {}", username);
+            debug!("Sending command: {}", username_cmd);
+            self.send_command(&username_cmd).await?;
+            let user_response = self.read_response().await?;
+            debug!("Username response: {}", user_response);
+
+            // Send password
+            let password_cmd = format!("AUTHINFO PASS {}", password);
+            debug!("Sending command: {}", password_cmd);
+            self.send_command(&password_cmd).await?;
+            let pass_response = self.read_response().await?;
+            debug!("Password response: {}", pass_response);
+
+            // Check final response
+            debug!("Server response: {}", pass_response);
+            if pass_response.starts_with("281") {
+                debug!("Authentication successful");
+            } else {
+                return Err(NntpError::AuthenticationFailed);
             }
         }
 
-        Ok(data)
+        Ok(())
+    }
+
+    pub async fn download_segment(&mut self, message_id: &str) -> Result<Vec<u8>, NntpError> {
+        if message_id.is_empty() {
+            return Err(NntpError::InvalidMessageId);
+        }
+
+        // Try to get the article directly first
+        debug!("Downloading segment: {}", message_id);
+        self.send_command(&format!("ARTICLE <{}>", message_id)).await?;
+        
+        // Read the response line as UTF-8 since it's a text command response
+        let response = self.read_response().await?;
+        debug!("Article response: {}", response);
+
+        if response.starts_with("220") {
+            // Article found, read the data as raw bytes
+            let mut data = Vec::new();
+            let mut line_bytes = Vec::new();
+            let mut total_bytes = 0;
+            
+            match self.stream.as_mut().unwrap() {
+                NntpStream::Plain(s) => {
+                    loop {
+                        line_bytes.clear();
+                        let bytes_read = s.read_until(b'\n', &mut line_bytes).await?;
+                        if bytes_read == 0 {
+                            break;
+                        }
+                        // Check for end of article marker
+                        if line_bytes.len() == 3 && line_bytes[0] == b'.' && line_bytes[1] == b'\r' && line_bytes[2] == b'\n' {
+                            break;
+                        }
+                        // Handle dot-stuffing: if line starts with .., remove one .
+                        if line_bytes.starts_with(b"..") {
+                            data.extend_from_slice(&line_bytes[1..]);
+                            total_bytes += line_bytes.len() - 1;
+                        } else {
+                            data.extend_from_slice(&line_bytes);
+                            total_bytes += line_bytes.len();
+                        }
+                        debug!("Downloaded {} bytes", total_bytes);
+                    }
+                }
+                NntpStream::Tls(s) => {
+                    loop {
+                        line_bytes.clear();
+                        let bytes_read = s.read_until(b'\n', &mut line_bytes).await?;
+                        if bytes_read == 0 {
+                            break;
+                        }
+                        // Check for end of article marker
+                        if line_bytes.len() == 3 && line_bytes[0] == b'.' && line_bytes[1] == b'\r' && line_bytes[2] == b'\n' {
+                            break;
+                        }
+                        // Handle dot-stuffing: if line starts with .., remove one .
+                        if line_bytes.starts_with(b"..") {
+                            data.extend_from_slice(&line_bytes[1..]);
+                            total_bytes += line_bytes.len() - 1;
+                        } else {
+                            data.extend_from_slice(&line_bytes);
+                            total_bytes += line_bytes.len();
+                        }
+                        debug!("Downloaded {} bytes", total_bytes);
+                    }
+                }
+            }
+
+            debug!("Segment download complete. Total bytes: {}", total_bytes);
+            Ok(data)
+        } else if response.starts_with("430") || response.starts_with("423") {
+            // Article not found
+            Err(NntpError::ArticleNotFound)
+        } else {
+            // Other error
+            Err(NntpError::Other(format!("Unexpected response: {}", response)))
+        }
     }
 }
 
