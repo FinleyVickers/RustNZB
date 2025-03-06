@@ -69,6 +69,7 @@ impl NntpClient {
                 s.read_line(&mut response).await?;
             }
         }
+        debug!("Server response: {}", response.trim());
         Ok(response)
     }
 
@@ -119,6 +120,7 @@ impl NntpClient {
     }
 
     pub async fn connect(&mut self, host: &str, port: u16, use_tls: bool) -> Result<(), NntpError> {
+        debug!("Connecting to {}:{} (SSL: {})", host, port, use_tls);
         let tcp_stream = TcpStream::connect((host, port)).await?;
         tcp_stream.set_nodelay(true)?;
 
@@ -127,20 +129,23 @@ impl NntpClient {
             let domain = ServerName::try_from(host)
                 .map_err(|_| NntpError::Other("Invalid hostname".to_string()))?;
 
-            // Try plain TLS first
+            debug!("Attempting TLS connection to {}", host);
             match connector.connect(domain.clone(), tcp_stream).await {
                 Ok(tls_stream) => {
+                    debug!("TLS connection successful");
                     self.stream = Some(NntpStream::Tls(BufReader::new(BufWriter::new(tls_stream))));
                 }
                 Err(e) => {
-                    debug!("TLS connection failed: {}", e);
+                    error!("TLS connection failed: {}", e);
                     // If TLS fails, try connecting without TLS
+                    debug!("Falling back to non-TLS connection");
                     let tcp_stream = TcpStream::connect((host, port)).await?;
                     tcp_stream.set_nodelay(true)?;
                     self.stream = Some(NntpStream::Plain(BufReader::new(BufWriter::new(tcp_stream))));
                 }
             }
         } else {
+            debug!("Using plain connection");
             self.stream = Some(NntpStream::Plain(BufReader::new(BufWriter::new(tcp_stream))));
         }
 
@@ -162,18 +167,23 @@ impl NntpClient {
             let user_response = self.read_response().await?;
             debug!("Username response: {}", user_response);
 
+            if !user_response.starts_with("381") {
+                error!("Unexpected response to USER command: {}", user_response);
+                return Err(NntpError::AuthenticationFailed);
+            }
+
             // Send password
             let password_cmd = format!("AUTHINFO PASS {}", password);
-            debug!("Sending command: {}", password_cmd);
+            debug!("Sending password");
             self.send_command(&password_cmd).await?;
             let pass_response = self.read_response().await?;
             debug!("Password response: {}", pass_response);
 
             // Check final response
-            debug!("Server response: {}", pass_response);
             if pass_response.starts_with("281") {
                 debug!("Authentication successful");
             } else {
+                error!("Authentication failed: {}", pass_response);
                 return Err(NntpError::AuthenticationFailed);
             }
         }
@@ -199,6 +209,7 @@ impl NntpClient {
             let mut data = Vec::new();
             let mut line_bytes = Vec::new();
             let mut total_bytes = 0;
+            let mut line_count = 0;
             
             match self.stream.as_mut().unwrap() {
                 NntpStream::Plain(s) => {
@@ -206,10 +217,12 @@ impl NntpClient {
                         line_bytes.clear();
                         let bytes_read = s.read_until(b'\n', &mut line_bytes).await?;
                         if bytes_read == 0 {
+                            debug!("End of stream reached");
                             break;
                         }
                         // Check for end of article marker
                         if line_bytes.len() == 3 && line_bytes[0] == b'.' && line_bytes[1] == b'\r' && line_bytes[2] == b'\n' {
+                            debug!("End of article marker found");
                             break;
                         }
                         // Handle dot-stuffing: if line starts with .., remove one .
@@ -220,7 +233,10 @@ impl NntpClient {
                             data.extend_from_slice(&line_bytes);
                             total_bytes += line_bytes.len();
                         }
-                        debug!("Downloaded {} bytes", total_bytes);
+                        line_count += 1;
+                        if line_count % 1000 == 0 {
+                            debug!("Downloaded {} lines, {} bytes", line_count, total_bytes);
+                        }
                     }
                 }
                 NntpStream::Tls(s) => {
@@ -228,10 +244,12 @@ impl NntpClient {
                         line_bytes.clear();
                         let bytes_read = s.read_until(b'\n', &mut line_bytes).await?;
                         if bytes_read == 0 {
+                            debug!("End of stream reached");
                             break;
                         }
                         // Check for end of article marker
                         if line_bytes.len() == 3 && line_bytes[0] == b'.' && line_bytes[1] == b'\r' && line_bytes[2] == b'\n' {
+                            debug!("End of article marker found");
                             break;
                         }
                         // Handle dot-stuffing: if line starts with .., remove one .
@@ -242,18 +260,23 @@ impl NntpClient {
                             data.extend_from_slice(&line_bytes);
                             total_bytes += line_bytes.len();
                         }
-                        debug!("Downloaded {} bytes", total_bytes);
+                        line_count += 1;
+                        if line_count % 1000 == 0 {
+                            debug!("Downloaded {} lines, {} bytes", line_count, total_bytes);
+                        }
                     }
                 }
             }
 
-            debug!("Segment download complete. Total bytes: {}", total_bytes);
+            debug!("Segment download complete. Total bytes: {}, lines: {}", total_bytes, line_count);
             Ok(data)
         } else if response.starts_with("430") || response.starts_with("423") {
             // Article not found
+            error!("Article not found: {}", message_id);
             Err(NntpError::ArticleNotFound)
         } else {
             // Other error
+            error!("Unexpected response for article {}: {}", message_id, response);
             Err(NntpError::Other(format!("Unexpected response: {}", response)))
         }
     }

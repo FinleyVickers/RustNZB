@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     /// List of Usenet servers in priority order
     pub servers: Vec<ServerConfig>,
@@ -22,7 +22,7 @@ pub struct Config {
     pub post_processing: PostProcessConfig,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ServerConfig {
     /// Server name for identification
     pub name: String,
@@ -46,7 +46,7 @@ pub struct ServerConfig {
     pub timeout: Option<u64>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DownloadConfig {
     /// Whether to verify article checksums
     pub verify_checksums: bool,
@@ -60,17 +60,17 @@ pub struct DownloadConfig {
     pub speed_limit: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PostProcessConfig {
     /// Whether to automatically extract archives
     pub auto_extract: bool,
-    /// Whether to clean up archives after successful extraction
+    /// Whether to delete archives after successful extraction
     pub cleanup_archives: bool,
-    /// Whether to create separate folders for each download
+    /// Whether to create folders for extracted content
     pub create_folders: bool,
-    /// Pattern for naming download folders
+    /// Pattern for naming created folders
     pub folder_naming_pattern: String,
-    /// Whether to automatically process par2 files
+    /// Whether to process par2 files for repair
     pub process_par2: bool,
     /// Categories to skip post-processing for
     pub skip_categories: Vec<String>,

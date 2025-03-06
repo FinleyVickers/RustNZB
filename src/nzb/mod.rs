@@ -86,6 +86,8 @@ impl NzbFile {
                                 poster,
                                 date,
                             });
+                            current_segments = Vec::new();
+                            current_groups = Vec::new();
                         }
                         b"meta" => {
                             if in_head {
@@ -124,6 +126,12 @@ impl NzbFile {
                             });
                             current_segment_index = Some(current_segments.len() - 1);
                         }
+                        b"group" => {
+                            // Don't clear groups here, we want to accumulate them
+                        }
+                        b"segments" => {
+                            current_segments = Vec::new();
+                        }
                         _ => {}
                     }
                 }
@@ -140,10 +148,19 @@ impl NzbFile {
                                     file.filename = extract_filename_from_subject(&file.subject);
                                 }
                                 
+                                // Sort segments by number to ensure correct order
+                                file.segments.sort_by_key(|s| s.number);
+                                
+                                // Calculate total bytes
+                                file.bytes = file.segments.iter().map(|s| s.bytes).sum();
+                                
                                 files.push(file);
-                                current_segments.clear();
-                                current_groups.clear();
+                                current_segments = Vec::new();
+                                current_groups = Vec::new();
                             }
+                        }
+                        b"group" => {
+                            // Don't clear groups here, we want to accumulate them
                         }
                         b"segment" => {
                             current_segment_index = None;
@@ -152,12 +169,16 @@ impl NzbFile {
                     }
                 }
                 Ok(Event::Text(e)) => {
+                    let text = String::from_utf8_lossy(&e.into_inner()).into_owned();
                     if let Some(file) = current_file.as_mut() {
                         if let Some(index) = current_segment_index {
                             // Update the message ID of the current segment
-                            current_segments[index].message_id = String::from_utf8_lossy(&e.into_inner()).into_owned();
+                            current_segments[index].message_id = text;
                         } else {
-                            file.subject = String::from_utf8_lossy(&e.into_inner()).into_owned();
+                            // If we're not in a segment, this might be a group name
+                            if !text.trim().is_empty() {
+                                current_groups.push(text);
+                            }
                         }
                     }
                 }
