@@ -1,11 +1,10 @@
-use anyhow::{Result, Context};
+use anyhow::Result;
 use async_trait::async_trait;
 use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader, BufWriter};
+use tokio::io::{AsyncWriteExt, AsyncBufReadExt, BufReader, BufWriter};
 use tokio_rustls::client::TlsStream;
 use rustls::{ClientConfig, RootCertStore};
-use tracing::debug;
-use thiserror::Error;
+use tracing::{debug, error};
 use tokio_rustls::rustls::ServerName;
 
 pub struct NntpConfig {
@@ -43,12 +42,16 @@ pub enum NntpError {
     AuthenticationRequired,
     #[error("Authentication failed (481/482)")]
     AuthenticationFailed,
+    #[error("Password required (381)")]
+    PasswordRequired,
+    #[error("Username required (381)")]
+    UsernameRequired,
     #[error("Invalid response: {0}")]
     InvalidResponse(String),
     #[error("Connection error: {0}")]
     ConnectionError(#[from] std::io::Error),
     #[error("TLS error: {0}")]
-    TlsError(#[from] tokio_rustls::rustls::Error),
+    TlsError(String),
     #[error("DNS error: {0}")]
     DnsError(String),
     #[error("Other error: {0}")]
@@ -64,10 +67,23 @@ impl NntpClient {
     }
 
     async fn handle_response(&mut self, response: &str) -> Result<(), NntpError> {
-        let code = response.split_whitespace().next()
+        debug!("Server response: {}", response);
+        
+        // Some servers might include a description after the response code
+        let parts: Vec<&str> = response.split_whitespace().collect();
+        let code = parts.first()
             .ok_or_else(|| NntpError::InvalidResponse("Empty response".to_string()))?;
         
-        match code {
+        match *code {
+            // Standard success codes
+            "200" | "201" | "211" | "215" | "220" | "221" | "222" | "223" | "224" => Ok(()),
+            // Authentication success
+            "281" => Ok(()),
+            "381" => {
+                debug!("Auth response: {}", response);
+                // Some servers might send 381 without explicitly mentioning "PASS"
+                Err(NntpError::PasswordRequired)
+            }
             "430" => Err(NntpError::ArticleNotFound),
             "480" => {
                 if response.to_lowercase().contains("authentication") {
@@ -77,7 +93,6 @@ impl NntpClient {
                 }
             }
             "481" | "482" => Err(NntpError::AuthenticationFailed),
-            "200" | "201" | "211" | "220" | "221" | "222" | "223" | "224" => Ok(()),
             _ => Err(NntpError::InvalidResponse(response.to_string())),
         }
     }
@@ -101,21 +116,52 @@ impl NntpClient {
             let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
             let tcp_stream = TcpStream::connect((self.config.host.as_str(), self.config.port))
                 .await
+                .map_err(|e| NntpError::ConnectionError(e))?;
+
+            // Set TCP_NODELAY for better performance
+            tcp_stream.set_nodelay(true)
                 .map_err(NntpError::ConnectionError)?;
             
             let dns_name = ServerName::try_from(self.config.host.as_str())
                 .map_err(|e| NntpError::DnsError(e.to_string()))?;
             
-            let tls_stream = connector.connect(dns_name, tcp_stream)
-                .await
-                .map_err(|e| NntpError::TlsError(e))?;
-            
-            let buffered = BufReader::new(BufWriter::new(tls_stream));
-            NntpStream::Tls(buffered)
+            // Add retry logic for TLS connection
+            let mut retry_count = 0;
+            let max_retries = 3;
+            let mut last_error = None;
+
+            while retry_count < max_retries {
+                match connector.connect(dns_name.clone(), tcp_stream.try_clone().await
+                    .map_err(NntpError::ConnectionError)?).await {
+                    Ok(tls_stream) => {
+                        let buffered = BufReader::new(BufWriter::new(tls_stream));
+                        break NntpStream::Tls(buffered);
+                    }
+                    Err(e) => {
+                        error!("TLS connection attempt {} failed: {}", retry_count + 1, e);
+                        last_error = Some(e);
+                        retry_count += 1;
+                        if retry_count < max_retries {
+                            // Small delay before retry
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+            }
+
+            if retry_count >= max_retries {
+                return Err(NntpError::TlsError(format!("Failed after {} attempts: {}", 
+                    max_retries, last_error.unwrap())));
+            }
         } else {
             let tcp_stream = TcpStream::connect((self.config.host.as_str(), self.config.port))
                 .await
                 .map_err(NntpError::ConnectionError)?;
+
+            // Set TCP_NODELAY for better performance
+            tcp_stream.set_nodelay(true)
+                .map_err(NntpError::ConnectionError)?;
+
             let buffered = BufReader::new(BufWriter::new(tcp_stream));
             NntpStream::Plain(buffered)
         };
@@ -132,27 +178,46 @@ impl NntpClient {
                 s.read_line(&mut response).await.map_err(NntpError::ConnectionError)?;
             }
         }
+        debug!("Welcome message: {}", response);
 
-        self.handle_response(&response).await?;
-
-        // Authenticate if credentials are provided
-        let username = self.config.username.clone();
-        let password = self.config.password.clone();
-        
-        if let (Some(username), Some(password)) = (username, password) {
-            let auth_response = self.send_command(&format!("AUTHINFO USER {}", username)).await?;
-            self.handle_response(&auth_response).await?;
+        // Some servers might require authentication regardless of welcome message
+        if let (Some(username), Some(password)) = (self.config.username.clone(), self.config.password.clone()) {
+            debug!("Starting authentication for user: {}", username);
             
-            let pass_response = self.send_command(&format!("AUTHINFO PASS {}", password)).await?;
-            self.handle_response(&pass_response).await?;
-        }
+            // Send username
+            let auth_response = self.send_command(&format!("AUTHINFO USER {}", username)).await?;
+            debug!("Username response: {}", auth_response);
 
-        Ok(())
+            // Always send password after username, regardless of response
+            let pass_response = self.send_command(&format!("AUTHINFO PASS {}", password)).await?;
+            debug!("Password response: {}", pass_response);
+
+            // Check final authentication status
+            match self.handle_response(&pass_response).await {
+                Ok(_) => {
+                    debug!("Authentication successful");
+                    Ok(())
+                }
+                Err(NntpError::AuthenticationFailed) => {
+                    error!("Authentication failed with correct credentials");
+                    Err(NntpError::AuthenticationFailed)
+                }
+                Err(e) => {
+                    error!("Unexpected error during authentication: {:?}", e);
+                    Err(e)
+                }
+            }
+        } else {
+            debug!("No credentials provided, skipping authentication");
+            self.handle_response(&response).await
+        }
     }
 
     async fn send_command(&mut self, command: &str) -> Result<String, NntpError> {
         let stream = self.stream.as_mut()
             .ok_or_else(|| NntpError::Other("Not connected".to_string()))?;
+        
+        debug!("Sending command: {}", command);
         
         // Send command
         match stream {
@@ -180,12 +245,19 @@ impl NntpClient {
                 s.read_line(&mut response).await.map_err(NntpError::ConnectionError)?;
             }
         }
+        debug!("Received response: {}", response);
 
         Ok(response)
     }
 
     pub async fn download_segment(&mut self, message_id: &str) -> Result<Vec<u8>, NntpError> {
         debug!("Downloading segment: {}", message_id);
+        
+        // Validate message ID
+        if message_id.trim().is_empty() {
+            error!("Empty message ID provided");
+            return Err(NntpError::Other("Empty message ID provided".to_string()));
+        }
         
         // Request article
         let response = self.send_command(&format!("ARTICLE {}", message_id)).await?;
